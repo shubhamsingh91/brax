@@ -24,19 +24,31 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from absl import logging
 from brax import envs
+from brax.experimental import normalization
 from brax.experimental.braxlines.training import env
 from brax.experimental.composer import data_utils
 from brax.training import distribution
 from brax.training import networks
-from brax.training import normalization
 from brax.training import pmap
-from brax.training import ppo
+from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
 import jax
 import jax.numpy as jnp
 import optax
+
+
+
+@flax.struct.dataclass
+class StepData:
+  """Contains data for one environment step."""
+  obs: jnp.ndarray
+  rewards: jnp.ndarray
+  dones: jnp.ndarray
+  truncation: jnp.ndarray
+  actions: jnp.ndarray
+  logits: jnp.ndarray
 
 
 @flax.struct.dataclass
@@ -59,8 +71,8 @@ class Agent:
 
 def compute_ppo_loss(
     models: Dict[str, Params],
-    data: ppo.StepData,
-    udata: ppo.StepData,
+    data: StepData,
+    udata: StepData,
     rng: PRNGKey,
     parametric_action_distribution: distribution.ParametricDistribution,
     policy_apply: Any,
@@ -106,7 +118,7 @@ def compute_ppo_loss(
   behaviour_action_log_probs = parametric_action_distribution.log_prob(
       logits, actions)
 
-  vs, advantages = ppo.compute_gae(
+  vs, advantages = ppo_losses.compute_gae(
       truncation=truncation,
       termination=termination,
       rewards=rewards,
@@ -180,13 +192,13 @@ def train(environment_fn: Callable[..., envs.Env],
           .NormalTanhDistribution,
           make_models_fn: Optional[Callable[
               [int, int],
-              Tuple[networks.FeedForwardModel]]] = networks.make_models,
+              Tuple[networks.FeedForwardNetwork]]] = networks.make_models,
           policy_params: Optional[Dict[str, jnp.ndarray]] = None,
           value_params: Optional[Dict[str, jnp.ndarray]] = None,
           extra_params: Optional[Dict[str, Dict[str, jnp.ndarray]]] = None,
           extra_step_kwargs: bool = True,
           extra_loss_update_ratios: Optional[Dict[str, float]] = None,
-          extra_loss_fns: Optional[Dict[str, Callable[[ppo.StepData],
+          extra_loss_fns: Optional[Dict[str, Callable[[StepData],
                                                       jnp.ndarray]]] = None):
   """PPO training."""
   assert batch_size * num_minibatches % num_envs == 0
@@ -235,7 +247,7 @@ def train(environment_fn: Callable[..., envs.Env],
     first_state, step_fn = env.wrap(
         core_env, key, extra_step_kwargs=extra_step_kwargs)
     tmp_env_states.append(first_state)
-  first_state = jax.tree_multimap(lambda *args: jnp.stack(args),
+  first_state = jax.tree_util.tree_map(lambda *args: jnp.stack(args),
                                   *tmp_env_states)
 
   normalizer_params, obs_normalizer_update_fn, obs_normalizer_apply_fn = (
@@ -301,9 +313,9 @@ def train(environment_fn: Callable[..., envs.Env],
 
   @jax.jit
   def run_eval(state, key, policy_params, normalizer_params, extra_params):
-    policy_params = jax.tree_map(lambda x: x[0], policy_params)
-    normalizer_params = jax.tree_map(lambda x: x[0], normalizer_params)
-    extra_params = jax.tree_map(lambda x: x[0], extra_params)
+    policy_params = jax.tree_util.tree_map(lambda x: x[0], policy_params)
+    normalizer_params = jax.tree_util.tree_map(lambda x: x[0], normalizer_params)
+    extra_params = jax.tree_util.tree_map(lambda x: x[0], extra_params)
     (state, _, _, _, key), _ = jax.lax.scan(
         do_one_step_eval,
         (state, policy_params, normalizer_params, extra_params, key), (),
@@ -331,7 +343,7 @@ def train(environment_fn: Callable[..., envs.Env],
     nstate = step_fn(state, postprocessed_actions, normalizer_params,
                      extra_params)
     return (nstate, normalizer_params, policy_params, extra_params,
-            key), ppo.StepData(
+            key), StepData(
                 obs=state.core.obs,
                 rewards=state.core.reward,
                 dones=state.core.done,
@@ -387,8 +399,8 @@ def train(environment_fn: Callable[..., envs.Env],
       data = jnp.swapaxes(data, 0, 1)
       return data
 
-    ndata = jax.tree_map(lambda x: convert_data(x, permutation), data)
-    u_ndata = jax.tree_map(lambda x: convert_data(x, permutation), udata)
+    ndata = jax.tree_util.tree_map(lambda x: convert_data(x, permutation), data)
+    u_ndata = jax.tree_util.tree_map(lambda x: convert_data(x, permutation), udata)
     (optimizer_state, params, _), metrics = jax.lax.scan(
         update_model, (optimizer_state, params, key_grad), (ndata, u_ndata),
         length=num_minibatches)
@@ -410,8 +422,8 @@ def train(environment_fn: Callable[..., envs.Env],
          get_params(training_state, 'extra', {}), key_generate_unroll), (),
         length=batch_size * num_minibatches // num_envs)
     # make unroll first
-    data = jax.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
-    data = jax.tree_map(
+    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+    data = jax.tree_util.tree_map(
         lambda x: jnp.reshape(x, [x.shape[0], -1] + list(x.shape[3:])), data)
 
     # Update normalization params and normalize observations.
@@ -440,7 +452,7 @@ def train(environment_fn: Callable[..., envs.Env],
     (training_state, state), losses = jax.lax.scan(
         run_epoch, (training_state, state), (),
         length=num_epochs // log_frequency)
-    losses = jax.tree_map(jnp.mean, losses)
+    losses = jax.tree_util.tree_map(jnp.mean, losses)
     return (training_state, state), losses
 
   minimize_loop = jax.pmap(_minimize_loop, axis_name='i')
@@ -499,11 +511,11 @@ def train(environment_fn: Callable[..., envs.Env],
       logging.info(metrics)
       if progress_fn:
         params = dict(
-            normalizer=jax.tree_map(lambda x: x[0],
+            normalizer=jax.tree_util.tree_map(lambda x: x[0],
                                     training_state.normalizer_params),
-            policy=jax.tree_map(lambda x: x[0],
+            policy=jax.tree_util.tree_map(lambda x: x[0],
                                 get_params(training_state, 'policy')),
-            extra=jax.tree_map(lambda x: x[0],
+            extra=jax.tree_util.tree_map(lambda x: x[0],
                                get_params(training_state, 'extra')))
         progress_fn(
             int(training_state.normalizer_params[0][0]) * action_repeat,
@@ -516,17 +528,17 @@ def train(environment_fn: Callable[..., envs.Env],
     previous_step = training_state.normalizer_params[0][0]
     # optimization
     (training_state, state), losses = minimize_loop(training_state, state)
-    jax.tree_map(lambda x: x.block_until_ready(), losses)
+    jax.tree_util.tree_map(lambda x: x.block_until_ready(), losses)
     sps = ((training_state.normalizer_params[0][0] - previous_step) /
            (time.time() - t)) * action_repeat
     training_walltime += time.time() - t
 
   # To undo the pmap.
-  normalizer_params = jax.tree_map(lambda x: x[0],
+  normalizer_params = jax.tree_util.tree_map(lambda x: x[0],
                                    training_state.normalizer_params)
-  policy_params = jax.tree_map(lambda x: x[0],
+  policy_params = jax.tree_util.tree_map(lambda x: x[0],
                                get_params(training_state, 'policy'))
-  extra_params = jax.tree_map(lambda x: x[0],
+  extra_params = jax.tree_util.tree_map(lambda x: x[0],
                               get_params(training_state, 'extra'))
 
   logging.info('total steps: %s', normalizer_params[0] * action_repeat)
@@ -552,7 +564,7 @@ def make_inference_fn(
     ], distribution.ParametricDistribution]] = distribution
     .NormalTanhDistribution,
     make_models_fn: Optional[Callable[
-        [int, int], Tuple[networks.FeedForwardModel]]] = networks.make_models):
+        [int, int], Tuple[networks.FeedForwardNetwork]]] = networks.make_models):
   """Creates params and inference function for the multi-agent PPO agent."""
   action_size = sum([s['size'] for s in action_shapes.values()])
   _, obs_normalizer_apply_fn = normalization.make_data_and_apply_fn(

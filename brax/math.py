@@ -32,6 +32,8 @@ def rotate(vec: Vector3, quat: Quaternion):
   Returns:
     ndarray(3) containing vec rotated by quat.
   """
+  if len(vec.shape) != 1:
+    raise AssertionError('vec must have no batch dimensions.')
   s, u = quat[0], quat[1:]
   r = 2 * (jp.dot(u, vec) * u) + (s * s - jp.dot(u, u)) * vec
   r = r + 2 * s * jp.cross(u, vec)
@@ -81,7 +83,8 @@ def quat_to_euler(q: Quaternion) -> Vector3:
 
   z = jp.arctan2(-2 * q[1] * q[2] + 2 * q[0] * q[3],
                  q[1] * q[1] + q[0] * q[0] - q[3] * q[3] - q[2] * q[2])
-  y = jp.arcsin(2 * q[1] * q[3] + 2 * q[0] * q[2])
+  # TODO: Investigate why quaternions go so big we need to clip.
+  y = jp.safe_arcsin(jp.clip(2 * q[1] * q[3] + 2 * q[0] * q[2], -1., 1.))
   x = jp.arctan2(-2 * q[2] * q[3] + 2 * q[0] * q[1],
                  q[3] * q[3] - q[2] * q[2] - q[1] * q[1] + q[0] * q[0])
 

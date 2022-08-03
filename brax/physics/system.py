@@ -43,14 +43,14 @@ class System:
                resource_paths: Optional[Sequence[str]] = None):
     config = validate_config(config, resource_paths=resource_paths)
     self.config = config
+    self.num_actuators = len(config.actuators)
+    self.num_joint_dof = sum(len(j.angle_limit) for j in config.joints)
     self.num_bodies = len(config.bodies)
     self.body = bodies.Body(config)
     self.colliders = colliders.get(config, self.body)
     self.num_joints = len(config.joints)
     self.joints = joints.get(config, self.body) + spring_joints.get(
         config, self.body)
-    self.num_actuators = len(config.actuators)
-    self.num_joint_dof = sum(len(j.angle_limit) for j in config.joints)
     self.actuators = actuators.get(config, self.joints)
     self.forces = forces.get(config, self.body)
     self.num_forces_dof = sum(f.act_index.shape[-1] for f in self.forces)
@@ -61,21 +61,24 @@ class System:
     if not self.config.joints:
       return jp.array([])
 
-    dofs = {j.name: len(j.angle_limit) for j in self.config.joints}
+    dofs = {}
+    for j in self.config.joints:
+      dofs[j.name] = sum([l.min != 0 or l.max != 0 for l in j.angle_limit])
     angles = {}
 
     # check overrides in config defaults
     if default_index < len(self.config.defaults):
       defaults = self.config.defaults[default_index]
       for ja in defaults.angles:
-        arr = vec_to_arr(ja.angle)[:dofs[ja.name]] * jp.pi / 180
-        angles[ja.name] = arr
+        angles[ja.name] = vec_to_arr(ja.angle)[:dofs[ja.name]] * jp.pi / 180
 
     # set remaining joint angles set from angle limits, and add jitter
     for joint in self.config.joints:
       if joint.name not in angles:
-        angle = [(l.min + l.max) * jp.pi / 360 for l in joint.angle_limit]
-        angles[joint.name] = jp.array(angle)
+        dof = dofs[joint.name]
+        angles[joint.name] = jp.array([
+            (l.min + l.max) * jp.pi / 360 for l in joint.angle_limit
+        ][:dof])
 
     return jp.concatenate([angles[j.name] for j in self.config.joints])
 
@@ -107,7 +110,7 @@ class System:
     joint_idxs = []
     for j in self.config.joints:
       beg = joint_idxs[-1][1][1] if joint_idxs else 0
-      dof = len(j.angle_limit)
+      dof = sum([l.min != 0 or l.max != 0 for l in j.angle_limit])
       joint_idxs.append((j, (beg, beg + dof)))
     lineage = {j.child: j.parent for j in self.config.joints}
     depth = {}
@@ -223,6 +226,7 @@ class System:
 
   def _pbd_step(self, qp: QP, act: jp.ndarray) -> Tuple[QP, Info]:
     """Position based dynamics stepping scheme."""
+
     # Just like XPBD except performs two physics substeps per collision update.
 
     def substep(carry, _):
@@ -307,6 +311,7 @@ class System:
 
   def _spring_step(self, qp: QP, act: jp.ndarray) -> Tuple[QP, Info]:
     """Spring-based dynamics stepping scheme."""
+
     # Resolves actuator forces, joints, and forces at acceleration level, and
     # resolves collisions at velocity level with baumgarte stabilization.
 

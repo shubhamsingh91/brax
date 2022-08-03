@@ -16,7 +16,7 @@
 """Some example environments to help get started quickly with brax."""
 
 import functools
-from typing import Callable, Optional, Union, overload
+from typing import Callable, Optional, Type, Union, overload
 
 import brax
 from brax.envs import acrobot
@@ -24,12 +24,13 @@ from brax.envs import ant
 from brax.envs import fast
 from brax.envs import fetch
 from brax.envs import grasp
-from brax.envs import halfcheetah
+from brax.envs import half_cheetah
 from brax.envs import hopper
 from brax.envs import humanoid
 from brax.envs import humanoid_standup
 from brax.envs import inverted_double_pendulum
 from brax.envs import inverted_pendulum
+from brax.envs import pusher
 from brax.envs import reacher
 from brax.envs import reacherangle
 from brax.envs import swimmer
@@ -42,16 +43,17 @@ import gym
 
 _envs = {
     'acrobot': acrobot.Acrobot,
-    'ant': ant.Ant,
+    'ant': functools.partial(ant.Ant, use_contact_forces=True),
     'fast': fast.Fast,
     'fetch': fetch.Fetch,
     'grasp': grasp.Grasp,
-    'halfcheetah': halfcheetah.Halfcheetah,
+    'halfcheetah': half_cheetah.Halfcheetah,
     'hopper': hopper.Hopper,
     'humanoid': humanoid.Humanoid,
     'humanoidstandup': humanoid_standup.HumanoidStandup,
     'inverted_pendulum': inverted_pendulum.InvertedPendulum,
     'inverted_double_pendulum': inverted_double_pendulum.InvertedDoublePendulum,
+    'pusher': pusher.Pusher,
     'reacher': reacher.Reacher,
     'reacherangle': reacherangle.ReacherAngle,
     'swimmer': swimmer.Swimmer,
@@ -60,8 +62,12 @@ _envs = {
 }
 
 
-def get_environment(env_name, **kwargs):
+def get_environment(env_name, **kwargs) -> Env:
   return _envs[env_name](**kwargs)
+
+
+def register_environment(env_name: str, env_class: Type[Env]):
+  _envs[env_name] = env_class
 
 
 def create(env_name: str,

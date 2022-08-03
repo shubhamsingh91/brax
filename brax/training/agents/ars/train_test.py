@@ -12,33 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ARS training tests."""
+"""Augmented Random Search training tests."""
 import pickle
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from brax import envs
-from brax.training import ars
+from brax.training.acme import running_statistics
+from brax.training.agents.ars import networks as ars_networks
+from brax.training.agents.ars import train as ars
 import jax
 
 
 class ARSTest(parameterized.TestCase):
   """Tests for ARS module."""
 
-
   @parameterized.parameters(True, False)
   def testModelEncoding(self, normalize_observations):
-    env_fn = envs.create_fn('fast')
-    _, params, _ = ars.train(env_fn, num_timesteps=128, episode_length=128)
-    env = env_fn()
-    inference = ars.make_inference_fn(env.observation_size, env.action_size,
-                                      normalize_observations)
+    env = envs.get_environment('fast')
+    _, params, _ = ars.train(
+        env,
+        num_timesteps=128,
+        episode_length=128,
+        normalize_observations=normalize_observations)
+    normalize_fn = lambda x, y: x
+    if normalize_observations:
+      normalize_fn = running_statistics.normalize
+    ars_network = ars_networks.make_policy_network(env.observation_size,
+                                                   env.action_size,
+                                                   normalize_fn)
+    inference = ars_networks.make_inference_fn(ars_network)
     byte_encoding = pickle.dumps(params)
     decoded_params = pickle.loads(byte_encoding)
 
     # Compute one action.
     state = env.reset(jax.random.PRNGKey(0))
-    action = inference(decoded_params, state.obs, jax.random.PRNGKey(0))
+    action = inference(decoded_params)(state.obs, jax.random.PRNGKey(0))[0]
     env.step(state, action)
 
 

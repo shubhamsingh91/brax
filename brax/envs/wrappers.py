@@ -18,6 +18,8 @@ from typing import ClassVar, Dict, Optional
 
 from brax import jumpy as jp
 from brax.envs import env as brax_env
+import dm_env
+from dm_env import specs
 import flax
 import gym
 from gym import spaces
@@ -110,10 +112,19 @@ class AutoResetWrapper(brax_env.Wrapper):
 
 @flax.struct.dataclass
 class EvalMetrics:
-  current_episode_metrics: Dict[str, jp.ndarray]
-  completed_episodes_metrics: Dict[str, jp.ndarray]
-  completed_episodes: jp.ndarray
-  completed_episodes_steps: jp.ndarray
+  """Dataclass holding evaluation metrics for Brax.
+
+    Args:
+        episode_metrics: Aggregated episode metrics since the beginning of the
+          episode.
+        active_episodes: Boolean vector tracking which episodes are not done
+          yet.
+        episode_steps: Integer vector tracking the number of steps in
+          the episode.
+  """
+  episode_metrics: Dict[str, jp.ndarray]
+  active_episodes: jp.ndarray
+  episode_steps: jp.ndarray
 
 
 class EvalWrapper(brax_env.Wrapper):
@@ -123,12 +134,9 @@ class EvalWrapper(brax_env.Wrapper):
     reset_state = self.env.reset(rng)
     reset_state.metrics['reward'] = reset_state.reward
     eval_metrics = EvalMetrics(
-        current_episode_metrics=jax.tree_map(jp.zeros_like,
-                                             reset_state.metrics),
-        completed_episodes_metrics=jax.tree_map(
-            lambda x: jp.zeros_like(jp.sum(x)), reset_state.metrics),
-        completed_episodes=jp.zeros(()),
-        completed_episodes_steps=jp.zeros(()))
+        episode_metrics=jax.tree_util.tree_map(jp.zeros_like, reset_state.metrics),
+        active_episodes=jp.ones_like(reset_state.reward),
+        episode_steps=jp.zeros_like(reset_state.reward))
     reset_state.info['eval_metrics'] = eval_metrics
     return reset_state
 
@@ -140,26 +148,17 @@ class EvalWrapper(brax_env.Wrapper):
     del state.info['eval_metrics']
     nstate = self.env.step(state, action)
     nstate.metrics['reward'] = nstate.reward
-    # steps stores the highest step reached when done = True, and then
-    # the next steps becomes action_repeat
-    completed_episodes_steps = state_metrics.completed_episodes_steps + jp.sum(
-        nstate.info['steps'] * nstate.done)
-    current_episode_metrics = jax.tree_multimap(
-        lambda a, b: a + b, state_metrics.current_episode_metrics,
-        nstate.metrics)
-    completed_episodes = state_metrics.completed_episodes + jp.sum(nstate.done)
-    completed_episodes_metrics = jax.tree_multimap(
-        lambda a, b: a + jp.sum(b * nstate.done),
-        state_metrics.completed_episodes_metrics, current_episode_metrics)
-    current_episode_metrics = jax.tree_multimap(
-        lambda a, b: a * (1 - nstate.done) + b * nstate.done,
-        current_episode_metrics, nstate.metrics)
+    episode_steps = jp.where(state_metrics.active_episodes,
+                             nstate.info['steps'], state_metrics.episode_steps)
+    episode_metrics = jax.tree_util.tree_map(
+        lambda a, b: a + b * state_metrics.active_episodes,
+        state_metrics.episode_metrics, nstate.metrics)
+    active_episodes = state_metrics.active_episodes * (1 - nstate.done)
 
     eval_metrics = EvalMetrics(
-        current_episode_metrics=current_episode_metrics,
-        completed_episodes_metrics=completed_episodes_metrics,
-        completed_episodes=completed_episodes,
-        completed_episodes_steps=completed_episodes_steps)
+        episode_metrics=episode_metrics,
+        active_episodes=active_episodes,
+        episode_steps=episode_steps)
     nstate.info['eval_metrics'] = eval_metrics
     return nstate
 
@@ -199,7 +198,8 @@ class GymWrapper(gym.Env):
 
     def step(state, action):
       state = self._env.step(state, action)
-      return state, state.obs, state.reward, state.done, state.metrics
+      info = {**state.metrics, **state.info}
+      return state, state.obs, state.reward, state.done, info
 
     self._step = jax.jit(step, backend=self.backend)
 
@@ -271,7 +271,8 @@ class VectorGymWrapper(gym.vector.VectorEnv):
 
     def step(state, action):
       state = self._env.step(state, action)
-      return state, state.obs, state.reward, state.done, state.metrics
+      info = {**state.metrics, **state.info}
+      return state, state.obs, state.reward, state.done, info
 
     self._step = jax.jit(step, backend=self.backend)
 
@@ -295,3 +296,92 @@ class VectorGymWrapper(gym.vector.VectorEnv):
       return image.render_array(sys, qp, 256, 256)
     else:
       return super().render(mode=mode)  # just raise an exception
+
+
+class DmEnvWrapper(dm_env.Environment):
+  """A wrapper that converts Brax Env to one that follows Dm Env API."""
+
+  def __init__(self,
+               env: brax_env.Env,
+               seed: int = 0,
+               backend: Optional[str] = None):
+    self._env = env
+    self.seed(seed)
+    self.backend = backend
+    self._state = None
+
+    if hasattr(self._env, 'observation_spec'):
+      self._observation_spec = self._env.observation_spec()
+    else:
+      obs_high = jp.inf * jp.ones(self._env.observation_size, dtype='float32')
+      self._observation_spec = specs.BoundedArray((self._env.observation_size,),
+                                                  minimum=-obs_high,
+                                                  maximum=obs_high,
+                                                  dtype=float,
+                                                  name='observation')
+
+    if hasattr(self._env, 'action_spec'):
+      self._action_spec = self._env.action_spec()
+    else:
+      action_high = jp.ones(self._env.action_size, dtype='float32')
+      self._action_spec = specs.BoundedArray((self._env.action_size,),
+                                             minimum=-action_high,
+                                             maximum=action_high,
+                                             dtype=float,
+                                             name='action')
+
+    self._reward_spec = specs.Array(shape=(), dtype=float, name='reward')
+    self._discount_spec = specs.BoundedArray(
+        shape=(), dtype=float, minimum=0., maximum=1., name='discount')
+
+    def reset(key):
+      key1, key2 = jp.random_split(key)
+      state = self._env.reset(key2)
+      return state, state.obs, key1
+
+    self._reset = jax.jit(reset, backend=self.backend)
+
+    def step(state, action):
+      state = self._env.step(state, action)
+      info = {**state.metrics, **state.info}
+      return state, state.obs, state.reward, state.done, info
+
+    self._step = jax.jit(step, backend=self.backend)
+
+  def reset(self):
+    self._state, obs, self._key = self._reset(self._key)
+    return dm_env.TimeStep(
+        step_type=dm_env.StepType.FIRST,
+        reward=None,
+        discount=None,
+        observation=obs)
+
+  def step(self, action):
+    self._state, obs, reward, done, info = self._step(self._state, action)
+    del info
+    return dm_env.TimeStep(
+        step_type=dm_env.StepType.MID if not done else dm_env.StepType.LAST,
+        reward=reward,
+        discount=None,
+        observation=obs)
+
+  def seed(self, seed: int = 0):
+    self._key = jax.random.PRNGKey(seed)
+
+  def observation_spec(self):
+    return self._observation_spec
+
+  def action_spec(self):
+    return self._action_spec
+
+  def reward_spec(self):
+    return self._reward_spec
+
+  def discount_spec(self):
+    return self._discount_spec
+
+  def render(self):
+    # pylint:disable=g-import-not-at-top
+    from brax.io import image
+    sys, qp = self._env.sys, self._state.qp
+    return image.render_array(sys, qp, 256, 256)

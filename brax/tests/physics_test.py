@@ -56,6 +56,7 @@ class BoxTest(absltest.TestCase):
     bodies {
       name: "box" mass: 1
       colliders { box { halfsize { x: 0.5 y: 0.5 z: 0.5 }}}
+      colliders { box { halfsize { x: 1 y: 1 z: 1 }} no_contact: true }
       inertia { x: 1 y: 1 z: 1 }
     }
     bodies { name: "Ground" frozen: { all: true } colliders { plane {}}}
@@ -144,6 +145,7 @@ class BoxCapsuleTest(absltest.TestCase):
       }
       qps { name: "capsule3" pos { x: 0 y: 0 z: 3 } }
     }
+    solver_scale_collide: .3
   """
 
   def test_box_hits_capsule(self):
@@ -153,9 +155,9 @@ class BoxCapsuleTest(absltest.TestCase):
     self.assertAlmostEqual(qp.pos[0, 2], 3.5, 2)
     self.assertAlmostEqual(qp.pos[2, 2], 3.5, 2)
 
-    step = jax.jit(sys.step)
-    for _ in range(50):
-      qp, _ = step(qp, jp.array([]))
+    step_fn = jax.jit(sys.step)
+    for _ in range(30):
+      qp, _ = step_fn(qp, jp.array([]))
     # Box should be on the capsule, rather than on the ground, for both masses
     # box falls on capsule
     self.assertAlmostEqual(qp.pos[0, 2], 2.5, 2)
@@ -183,19 +185,20 @@ class HeightMapTest(absltest.TestCase):
       colliders {
         heightMap {
           size: 10
-          data: [0, 0, 0, 0, 0, 0, 0, 0, 0]
+          data: [1, 2, 3, 1, 2, 3, 1, 2, 3]
         }
       }
     }
-    defaults { qps { name: "box" pos: {x: 5 y: 5 z: 1}}}
+    # Place a box in the bottom left quadrant of a height map.
+    defaults { qps { name: "box" pos: {x: 1.5 y: -7.5 z: 4}}}
   """
 
   def test_box_stays_on_heightmap(self):
-    """A box falls onto the height map and stjp."""
+    """A box falls onto the bottom left of the height map."""
     sys = brax.System(text_format.Parse(HeightMapTest._CONFIG, brax.Config()))
     qp = sys.default_qp()
     qp, _ = jax.jit(sys.step)(qp, jp.array([]))
-    self.assertAlmostEqual(qp.pos[0, 2], 0.3, 2)
+    self.assertGreater(qp.pos[0, 2], 2.0)
 
 
 class SphereTest(absltest.TestCase):
@@ -341,9 +344,9 @@ class MeshTest(absltest.TestCase):
     # Cylinder should be up in the air.
     self.assertAlmostEqual(qp.pos[0, 2], 1.5, 2)
 
-    step = jax.jit(sys.step)
+    step_fn = jax.jit(sys.step)
     for _ in range(30):
-      qp, _ = step(qp, jp.array([]))
+      qp, _ = step_fn(qp, jp.array([]))
     # Cylinder should be on the ground.
     self.assertAlmostEqual(qp.pos[0, 2], 0, 2)
 
@@ -357,9 +360,9 @@ class MeshTest(absltest.TestCase):
     qp = sys.default_qp()
     self.assertAlmostEqual(qp.pos[0, 2], 1.5, 2)
 
-    step = jax.jit(sys.step)
+    step_fn = jax.jit(sys.step)
     for _ in range(30):
-      qp, _ = step(qp, jp.array([]))
+      qp, _ = step_fn(qp, jp.array([]))
     # Cylinder should be on the capsule, rather than on the ground.
     self.assertAlmostEqual(qp.pos[0, 2], 0.394, 2)
 
@@ -631,6 +634,54 @@ class Actuator3DTest(parameterized.TestCase):
           self.assertAlmostEqual(angle, limit, 1)  # actuated to target angle
 
 
+class SphericalizeTest(parameterized.TestCase):
+
+  _CONFIG = """
+    substeps: 2
+    dt: .01
+    gravity { z: 0.0 }
+    bodies { name: "Segment_1" mass: 1 inertia { x: 1 y: 1 z: 1 }}
+    bodies { name: "Segment_2" mass: 1 inertia { x: 1 y: 1 z: 1 }}
+    bodies { name: "Segment_3" mass: 1 inertia { x: 1 y: 1 z: 1 }}
+    bodies { name: "Segment_4" mass: 1 inertia { x: 1 y: 1 z: 1 }}
+    joints {
+      name: "Joint_1_2" parent: "Segment_1" child: "Segment_2"
+      child_offset { z: 1 }
+      angle_limit { min: -180 max: 180 }
+    }
+    joints {
+      name: "Joint_2_3" parent: "Segment_2" child: "Segment_3"
+      child_offset { z: 1 }
+      angle_limit { min: -180 max: 180 }
+      angle_limit { min: -180 max: 180 }
+    }
+    joints {
+      name: "Joint_3_4" parent: "Segment_3" child: "Segment_4"
+      child_offset { z: 1 }
+      angle_limit { min: -180 max: 180 }
+      angle_limit { min: -180 max: 180 }
+      angle_limit { min: -180 max: 180 }
+    }
+  """
+
+  def test_free_dofs(self):
+    """Constructs a sphericalized joint with differing free dofs per joint."""
+    config = text_format.Parse(SphericalizeTest._CONFIG, brax.Config())
+    sys = brax.System(config)
+
+    # 3 joints have been sphericalized into 1 spherical joint
+    self.assertLen(sys.joints, 1)
+    # correct number of free dofs for each joint
+    self.assertEqual(sys.joints[0].free_dofs, [1, 2, 3])
+    # correct indices are tracked as free
+    joint = sys.joints[0]
+    dof_indices = jp.concatenate([
+        jp.arange(i * joint.dof, i * joint.dof + dw)
+        for i, dw in enumerate(joint.free_dofs)
+    ])
+    self.assertListEqual(list(dof_indices), [0, 3, 4, 6, 7, 8])
+
+
 class ForceTest(parameterized.TestCase):
 
   _CONFIG = """
@@ -674,10 +725,15 @@ class ForceTest(parameterized.TestCase):
 
 class ElasticityTest(parameterized.TestCase):
   _CONFIG = """
-  dt: 1. substeps: 1000 friction: 0.0 elasticity: 0.5
+  dt: 0.01 substeps: 10 friction: 0.0 elasticity: 1.0
   gravity { z: -9.8 }
   bodies {
     name: "sphere" mass: 1
+    colliders { capsule { radius: .5 length: 1.0 } }
+    inertia { x: 1 y: 1 z: 1 }
+    }
+  bodies {
+    name: "sphere_stationary" mass: 1
     colliders { capsule { radius: .5 length: 1.0 } }
     inertia { x: 1 y: 1 z: 1 }
     }
@@ -688,8 +744,12 @@ class ElasticityTest(parameterized.TestCase):
     frozen { all: true}
   }
   bodies { name: "Ground" frozen: { all: true } colliders { plane {}}}
-  defaults { qps { name: "sphere" vel {x: 10}}
-             qps { name: "boxwall" pos { x: 10 } }}
+  defaults { qps { name: "sphere" vel {x: 10 y: 0 z: 0} pos {z: .5} }
+              qps { name: "sphere_stationary" pos { x: -20 y: 0 z: .5 } }
+              qps { name: "boxwall" pos { x: 10 } } }
+  defaults { qps { name: "sphere" pos { z: 1.5 } vel { z: 5.0 } }
+              qps { name: "sphere_stationary" pos { x: 0 y: 0 z: .5 } }
+              qps { name: "boxwall" pos { x: 10 } } }
   """
 
   @parameterized.parameters(0, .5, 1.)
@@ -698,12 +758,52 @@ class ElasticityTest(parameterized.TestCase):
     config = text_format.Parse(ElasticityTest._CONFIG, brax.Config())
     config.elasticity = elasticity
     sys = brax.System(config=config)
-    qp = sys.default_qp()
+    qp = sys.default_qp(0)
     qp_init = qp
-    qp, _ = sys.step(qp, jp.array([]))
+    step_fn = jax.jit(sys.step)
+    for _ in range(100):
+      qp, _ = step_fn(qp, jp.array([]))
 
     self.assertAlmostEqual(qp_init.vel[0][0] * (-1) * (elasticity**2.),
                            qp.vel[0][0], 2)
+
+  @parameterized.parameters(0, 1.)
+  def test_ball_bounce_vertical(self, elasticity):
+    """A ball bounces off another ball, with gravity."""
+    config = text_format.Parse(ElasticityTest._CONFIG, brax.Config())
+    config.elasticity = elasticity
+    # time to reach the ball again.
+    impact_time = 2 * 5 / 9.8
+    config.dt = impact_time / 100.
+    sys = brax.System(config=config)
+    qp = sys.default_qp(1)
+    qp_init = qp
+    step_fn = jax.jit(sys.step)
+    for _ in range(400):
+      qp, _ = step_fn(qp, jp.array([]))
+
+    self.assertAlmostEqual(
+        qp_init.vel[0][2] * (elasticity**2.), qp.vel[0][2], delta=.02)
+
+  @parameterized.parameters(0, 1.)
+  def test_ball_bounce_vertical_frozen(self, elasticity):
+    """A ball bounces off another frozen ball, with gravity."""
+    config = text_format.Parse(ElasticityTest._CONFIG, brax.Config())
+    config.elasticity = elasticity
+    # freeze the ground ball
+    config.bodies[1].frozen.all = True
+    # time to reach the ball again.
+    impact_time = 2 * 5 / 9.8
+    config.dt = impact_time / 100.
+    sys = brax.System(config=config)
+    qp = sys.default_qp(1)
+    qp_init = qp
+    step_fn = jax.jit(sys.step)
+    for _ in range(100):
+      qp, _ = step_fn(qp, jp.array([]))
+
+    self.assertAlmostEqual(
+        qp_init.vel[0][2] * (elasticity**2.), qp.vel[0][2], delta=.04)
 
 
 if __name__ == '__main__':

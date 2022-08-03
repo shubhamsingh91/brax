@@ -24,7 +24,7 @@ from setuptools import setup
 
 setup(
     name="brax",
-    version="0.0.12",
+    version="0.0.13",
     description=("A differentiable physics engine written in JAX."),
     author="Brax Authors",
     author_email="no-reply@google.com",
@@ -38,6 +38,7 @@ setup(
     install_requires=[
         "absl-py",
         "dataclasses",
+        "dm_env",
         "flax",
         "gym",
         "grpcio",
@@ -49,6 +50,10 @@ setup(
         "pytinyrenderer",
         "tensorboardX",
         "trimesh",
+        "typing-extensions",
+        # TODO: remove when
+        #   https://github.com/google/flax/issues/2190 is fixed.
+        "PyYAML>=6.0",
     ],
     extras_require={
         "develop": ["pytest", "transforms3d"],
